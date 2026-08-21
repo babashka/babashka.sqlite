@@ -22,6 +22,7 @@
                    ;; winsqlite3.dll ships with Windows itself
                    :windows ["sqlite3.dll" "winsqlite3.dll"]})
 
+(defcfn ^:private c-initialize "sqlite3_initialize" [] :int)
 (defcfn ^:private c-libversion "sqlite3_libversion" [] :string)
 (defcfn ^:private c-close "sqlite3_close" [:pointer] :int)
 (defcfn ^:private c-errmsg "sqlite3_errmsg" [:pointer] :string)
@@ -71,6 +72,10 @@
   []
   (c-libversion))
 
+;; builds compiled with SQLITE_OMIT_AUTOINIT (common for standalone
+;; Windows dlls) crash in sqlite3_open unless the library is initialized
+(defonce ^:private initialized (delay (c-initialize)))
+
 (def ^:private SQLITE-OPEN-READONLY 0x1)
 (def ^:private SQLITE-OPEN-READWRITE 0x2)
 (def ^:private SQLITE-OPEN-CREATE 0x4)
@@ -86,6 +91,7 @@
   and close!."
   ([path] (open path nil))
   ([path {:keys [read-only flags]}]
+   @initialized
    (let [pdb (ffi/alloc (ffi/sizeof :pointer))
          flags (or flags
                    (if read-only
