@@ -1,20 +1,20 @@
 (ns babashka.sqlite3
-  "SQLite over babashka.ffi against libsqlite3. Query vectors follow the
-  [sql & params] shape, so honeysql-formatted vectors work as-is:
+  "Use SQLite from babashka through babashka.ffi. Pass SQL as a string or
+  as a [sql & params] vector:
 
       (require '[babashka.sqlite3 :as sq])
       (sq/query \"app.db\" [\"select * from users where name = ?\" \"rich\"])
 
-  A string db argument opens and closes the database around the call; nil
-  opens an in-memory database. For many operations hold a connection:
+  A string file path opens and closes a connection for each call. nil uses an
+  in-memory database. Keep one connection open for multiple operations:
 
       (sq/with-db [db \"app.db\"]
         (sq/execute! db \"create table t (i integer, s text)\")
         (sq/query db \"select * from t\"))
 
-  Rows come back as maps with keywordized column names. SQLite types values
-  per cell: INTEGER comes back as a long, REAL as a double, TEXT as a
-  string, BLOB as a byte array, NULL as nil."
+  query returns a vector of row maps with keyword column names. Result values
+  use longs, doubles, strings, byte arrays, and nil for the corresponding
+  SQLite storage classes."
   (:require [babashka.ffi :as ffi :refer [defcfn]]))
 
 (ffi/load-library {:mac "libsqlite3.dylib"
@@ -67,7 +67,7 @@
 (def ^:private sqlite-transient -1)
 
 (defn version
-  "The SQLite library version string."
+  "Returns the SQLite library version."
   []
   (c-libversion))
 
@@ -76,12 +76,14 @@
 (def ^:private SQLITE-OPEN-CREATE 0x4)
 
 (defn open
-  "Opens the database at path, nil for in-memory. Returns a connection for
-  use with execute!, query, create-function! and close!. Sets a 5s busy
-  timeout, so concurrent writers wait instead of failing with SQLITE_BUSY.
+  "Opens a SQLite connection. A nil path creates an in-memory database for
+  this connection. A file path opens or creates a database.
 
-  opts: :read-only opens the existing database read-only; :flags passes
-  raw SQLITE_OPEN_* flags instead."
+  Use the connection from one thread at a time. The connection has a five-second
+  busy timeout. The :read-only option opens an existing database without write
+  access. The :flags option sets raw SQLITE_OPEN_* flags instead. Returns a
+  connection for use with query, execute!, create-function!, create-aggregate!,
+  and close!."
   ([path] (open path nil))
   ([path {:keys [read-only flags]}]
    (let [pdb (ffi/alloc (ffi/sizeof :pointer))
@@ -101,8 +103,8 @@
        (finally (ffi/free pdb))))))
 
 (defn close!
-  "Closes a connection returned by open and releases its registered
-  functions."
+  "Closes a connection from open and releases its registered functions.
+  Returns nil."
   [{:keys [db fns]}]
   (c-close db)
   (when fns
@@ -111,8 +113,12 @@
   nil)
 
 (defmacro with-db
-  "(with-db [db \"app.db\"] ...) - opens the database (nil path =
-  in-memory), binds the connection, closes it after the body."
+  "Opens a database for the enclosed code. Closes the connection after the
+  code finishes. Returns the result of the enclosed code. Use nil for an
+  in-memory database.
+
+      (with-db [db \"app.db\"]
+        (query db \"select * from users\"))"
   [[sym path] & body]
   `(let [~sym (open ~path)]
      (try ~@body
@@ -238,14 +244,18 @@
     conn))
 
 (defn create-function!
-  "Registers Clojure function f as SQL function name on the connection.
-  nargs is the argument count SQL calls must use, -1 (the default) for any
-  number. f receives decoded values (longs, doubles, strings, byte arrays,
-  nil) and its return value becomes the SQL result. An exception inside f
-  becomes a SQL error. The function stays registered until close!.
+  "Registers f on conn as a SQL function. SQL calls the function by name.
+  Returns conn.
 
-  opts: :deterministic declares that f always returns the same result for
-  the same arguments, which lets sqlite cache and optimize calls."
+  f receives longs, doubles, strings, byte arrays, and nil. It can return these
+  values or a boolean. An exception from f becomes a SQL error.
+
+  Pass nargs before f to require a fixed argument count. If you omit nargs,
+  the function accepts any number of arguments.
+
+  The :deterministic option declares that f always returns the same result for
+  the same arguments. SQLite can then cache or optimize calls. The registration
+  lasts until close! closes conn."
   ([conn name f] (create-function! conn name -1 f nil))
   ([conn name nargs-or-f f-or-opts]
    (if (fn? nargs-or-f)
@@ -264,21 +274,24 @@
      (register! conn name nargs deterministic xfunc nil nil))))
 
 (defn create-aggregate!
-  "Registers a Clojure aggregate as SQL function name on the connection,
-  reduce-style:
+  "Registers a reduce-style aggregate on conn. SQL calls the aggregate by name.
+  Returns conn.
 
       (create-aggregate! db \"product\"
         {:init 1
          :step (fn [acc v] (* acc v))})
 
-  :init is the starting accumulator value, :step receives the accumulator
-  and the decoded row values and returns the next accumulator, :finish
-  (default identity) turns the final accumulator into the SQL result.
-  Over zero rows the result is (finish init). nargs as in
-  create-function!, opts likewise (:deterministic).
+  :init is the initial accumulator value. :step receives the accumulator and
+  the values from one row. It returns the next accumulator. :finish converts
+  the final accumulator to the SQL result. Its default is identity.
 
-  State lives per group, so group by works. An exception inside step or
-  finish becomes a SQL error."
+  For zero rows, the :finish function receives the :init value. Pass the
+  required argument count before spec. If you omit the count, the aggregate
+  accepts any number of arguments. :deterministic has the same meaning as in
+  create-function!.
+
+  The aggregate keeps separate state for each group. An exception from :step
+  or :finish becomes a SQL error."
   ([conn name spec] (create-aggregate! conn name -1 spec))
   ([conn name nargs {:keys [init step finish deterministic]}]
    (let [finish (or finish identity)
@@ -326,23 +339,31 @@
     (with-db [db db-or-path] (f db))))
 
 (defn query
-  "Runs a select. db is a connection from open, or a path (opened and closed
-  around the call, nil for in-memory). q is a SQL string or a [sql & params]
-  vector. Returns a vector of maps with keywordized column names."
+  "Runs a query and returns a vector of maps. Each map is one result row.
+  Column names are keywords. SQL NULL values become nil.
+
+  db can be a connection from open, a database file path, or nil. q can be a
+  SQL string or a vector. The vector starts with SQL. Each ? in SQL uses the
+  next value in the vector. A file path or nil opens and closes a connection
+  for this call."
   [db q]
   (with-conn db (fn [db] (run* db q true))))
 
 (defn execute!
-  "Runs a statement. Arguments as in query. Returns {:rows-changed n
-  :last-insert-rowid id}."
+  "Runs a statement and returns {:rows-changed n :last-insert-rowid id}.
+
+  :rows-changed is the number of rows that the statement changed.
+  :last-insert-rowid is the row ID from the most recent insert on the
+  connection. db and q accept the same values as query."
   [db q]
   (with-conn db (fn [db] (run* db q false))))
 
 (defmacro with-transaction
-  "Runs body inside BEGIN IMMEDIATE .. COMMIT on connection db, rolling
-  back when body throws. IMMEDIATE takes the write lock up front, so
-  concurrent writers wait on the busy timeout instead of deadlocking on a
-  lock upgrade. Statements inside the body must use the same connection."
+  "Evaluates body in an immediate transaction on db. Commits when body returns
+  and returns its result. Rolls back when body throws.
+
+  An immediate transaction takes the write lock before body starts. The
+  transaction owns db until body finishes. All statements in body must use db."
   [db & body]
   `(let [db# ~db]
      (execute! db# "begin immediate")
@@ -355,8 +376,8 @@
          (throw e#)))))
 
 (defn interrupt!
-  "Interrupts the running query on connection db, from any thread. The
-  interrupted query throws."
+  "Interrupts the running query on db. Call this function from another thread.
+  The interrupted query throws an exception. Returns nil."
   [{:keys [db]}]
   (c-interrupt db)
   nil)
