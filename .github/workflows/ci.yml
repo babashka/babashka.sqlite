@@ -22,10 +22,6 @@ jobs:
       # sqlite ships with macOS, Linux (libsqlite3.so.0) and Windows
       # (winsqlite3.dll): nothing to install
 
-      - name: Debug windows symbol resolution
-        if: runner.os == 'Windows'
-        run: ./bb.exe -cp src debug_win.clj
-
       - name: Run tests
         run: |
           if [ "$RUNNER_OS" = "Windows" ]; then bb=./bb.exe; else bb=./bb; fi
