@@ -7,6 +7,7 @@
 (prn :aggregate-ctx-addr (ffi/find-symbol "sqlite3_aggregate_context"))
 (prn :missing-addr (ffi/find-symbol "definitely_not_a_symbol_xyz"))
 (prn :version ((ffi/cfn "sqlite3_libversion" [] :string)))
+(prn :init-rc ((ffi/cfn "sqlite3_initialize" [] :int)))
 (prn :open-rc
      (let [f (ffi/cfn "sqlite3_open" [:string :pointer] :int)
            pdb (ffi/alloc 8)]
