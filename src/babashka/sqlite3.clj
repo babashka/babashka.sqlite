@@ -23,7 +23,6 @@
                    :windows ["sqlite3.dll" "winsqlite3.dll"]})
 
 (defcfn ^:private c-libversion "sqlite3_libversion" [] :string)
-(defcfn ^:private c-open "sqlite3_open" [:string :pointer] :int)
 (defcfn ^:private c-close "sqlite3_close" [:pointer] :int)
 (defcfn ^:private c-errmsg "sqlite3_errmsg" [:pointer] :string)
 (defcfn ^:private c-busy-timeout "sqlite3_busy_timeout" [:pointer :int] :int)
@@ -44,6 +43,21 @@
 (defcfn ^:private c-bind-text "sqlite3_bind_text" [:pointer :int :string :int :pointer] :int)
 (defcfn ^:private c-bind-blob "sqlite3_bind_blob" [:pointer :int :pointer :int :pointer] :int)
 (defcfn ^:private c-bind-null "sqlite3_bind_null" [:pointer :int] :int)
+(defcfn ^:private c-open-v2 "sqlite3_open_v2" [:string :pointer :int :pointer] :int)
+(defcfn ^:private c-create-function "sqlite3_create_function_v2"
+  [:pointer :string :int :int :pointer :pointer :pointer :pointer :pointer] :int)
+(defcfn ^:private c-value-type "sqlite3_value_type" [:pointer] :int)
+(defcfn ^:private c-value-int64 "sqlite3_value_int64" [:pointer] :int64)
+(defcfn ^:private c-value-double "sqlite3_value_double" [:pointer] :double)
+(defcfn ^:private c-value-text "sqlite3_value_text" [:pointer] :string)
+(defcfn ^:private c-value-blob "sqlite3_value_blob" [:pointer] :pointer)
+(defcfn ^:private c-value-bytes "sqlite3_value_bytes" [:pointer] :int)
+(defcfn ^:private c-result-int64 "sqlite3_result_int64" [:pointer :int64] :void)
+(defcfn ^:private c-result-double "sqlite3_result_double" [:pointer :double] :void)
+(defcfn ^:private c-result-text "sqlite3_result_text" [:pointer :string :int :pointer] :void)
+(defcfn ^:private c-result-blob "sqlite3_result_blob" [:pointer :pointer :int :pointer] :void)
+(defcfn ^:private c-result-null "sqlite3_result_null" [:pointer] :void)
+(defcfn ^:private c-result-error "sqlite3_result_error" [:pointer :string :int] :void)
 
 ;; SQLITE_TRANSIENT: sqlite must copy text and blob buffers during the bind
 ;; call, because the buffers babashka.ffi passes are freed when it returns
@@ -54,27 +68,43 @@
   []
   (c-libversion))
 
+(def ^:private SQLITE-OPEN-READONLY 0x1)
+(def ^:private SQLITE-OPEN-READWRITE 0x2)
+(def ^:private SQLITE-OPEN-CREATE 0x4)
+
 (defn open
   "Opens the database at path, nil for in-memory. Returns a connection for
-  use with execute!, query and close!. Sets a 5s busy timeout, so
-  concurrent writers wait instead of failing with SQLITE_BUSY."
-  [path]
-  (let [pdb (ffi/alloc (ffi/sizeof :pointer))]
-    (try
-      (let [rc (c-open (or path ":memory:") pdb)
-            db (ffi/read pdb :pointer)]
-        (when-not (zero? rc)
-          (let [msg (c-errmsg db)]
-            (c-close db)
-            (throw (ex-info (str "sqlite3: " msg) {:path path}))))
-        (c-busy-timeout db 5000)
-        {:db db})
-      (finally (ffi/free pdb)))))
+  use with execute!, query, create-function! and close!. Sets a 5s busy
+  timeout, so concurrent writers wait instead of failing with SQLITE_BUSY.
+
+  opts: :read-only opens the existing database read-only; :flags passes
+  raw SQLITE_OPEN_* flags instead."
+  ([path] (open path nil))
+  ([path {:keys [read-only flags]}]
+   (let [pdb (ffi/alloc (ffi/sizeof :pointer))
+         flags (or flags
+                   (if read-only
+                     SQLITE-OPEN-READONLY
+                     (bit-or SQLITE-OPEN-READWRITE SQLITE-OPEN-CREATE)))]
+     (try
+       (let [rc (c-open-v2 (or path ":memory:") pdb flags ffi/null)
+             db (ffi/read pdb :pointer)]
+         (when-not (zero? rc)
+           (let [msg (c-errmsg db)]
+             (c-close db)
+             (throw (ex-info (str "sqlite3: " msg) {:path path}))))
+         (c-busy-timeout db 5000)
+         {:db db :fns (atom [])})
+       (finally (ffi/free pdb))))))
 
 (defn close!
-  "Closes a connection returned by open."
-  [{:keys [db]}]
+  "Closes a connection returned by open and releases its registered
+  functions."
+  [{:keys [db fns]}]
   (c-close db)
+  (when fns
+    (doseq [cb @fns] (ffi/free-callback cb))
+    (reset! fns []))
   nil)
 
 (defmacro with-db
@@ -153,6 +183,66 @@
         ;; finalizing a NULL statement (failed prepare) is a no-op
         (c-finalize (ffi/read pstmt :pointer))
         (ffi/free pstmt)))))
+
+(def ^:private SQLITE-UTF8 1)
+(def ^:private SQLITE-DETERMINISTIC 0x800)
+
+(defn- decode-value [pv]
+  (case (c-value-type pv)
+    1 (c-value-int64 pv)
+    2 (c-value-double pv)
+    3 (c-value-text pv)
+    4 (let [n (c-value-bytes pv)
+            p (c-value-blob pv)
+            arr (byte-array n)]
+        (dotimes [j n] (aset arr j (byte (ffi/read p :int8 j))))
+        arr)
+    5 nil))
+
+(defn- set-result! [ctx v]
+  (cond
+    (nil? v) (c-result-null ctx)
+    (boolean? v) (c-result-int64 ctx (if v 1 0))
+    (integer? v) (c-result-int64 ctx v)
+    (float? v) (c-result-double ctx v)
+    (string? v) (c-result-text ctx v -1 sqlite-transient)
+    (bytes? v) (let [n (alength ^bytes v)
+                     p (ffi/alloc (max n 1))]
+                 (try
+                   (dotimes [j n] (ffi/write p :int8 j (aget ^bytes v j)))
+                   (c-result-blob ctx p n sqlite-transient)
+                   (finally (ffi/free p))))
+    :else (c-result-error ctx (str "cannot return " (type v) " from a function") -1)))
+
+(defn create-function!
+  "Registers Clojure function f as SQL function name on the connection.
+  nargs is the argument count, -1 for variadic. f receives decoded values
+  (longs, doubles, strings, byte arrays, nil) and its return value becomes
+  the SQL result. An exception inside f becomes a SQL error. The function
+  stays registered until close!.
+
+  opts: :deterministic declares that f always returns the same result for
+  the same arguments, which lets sqlite cache and optimize calls."
+  ([conn name nargs f] (create-function! conn name nargs f nil))
+  ([{:keys [db fns] :as conn} name nargs f {:keys [deterministic]}]
+   (let [xfunc (fn [ctx argc argv]
+                 ;; an exception crossing the C boundary would abort the
+                 ;; process: everything is caught and reported to sqlite
+                 (try
+                   (let [args (mapv (fn [i] (decode-value (ffi/read argv :pointer (* 8 i))))
+                                    (range argc))]
+                     (set-result! ctx (apply f args)))
+                   (catch Throwable e
+                     (c-result-error ctx (str (ex-message e)) -1))))
+         cb (ffi/callback xfunc [:pointer :int :pointer] :void)
+         rc (c-create-function db name nargs
+                               (cond-> SQLITE-UTF8 deterministic (bit-or SQLITE-DETERMINISTIC))
+                               ffi/null cb ffi/null ffi/null ffi/null)]
+     (when-not (zero? rc)
+       (ffi/free-callback cb)
+       (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:function name})))
+     (swap! fns conj cb)
+     conn)))
 
 (defn- with-conn [db-or-path f]
   (if (map? db-or-path)

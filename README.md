@@ -36,7 +36,28 @@ work as-is. Binds accept integers, doubles, strings, byte arrays,
 booleans (as 0/1) and nil.
 
 Connections set a 5 second busy timeout, so concurrent writers wait
-instead of failing with SQLITE_BUSY.
+instead of failing with SQLITE_BUSY. Pass `{:read-only true}` to `open`
+to open an existing database read-only.
+
+## Clojure functions in SQL
+
+`create-function!` registers a Clojure function on a connection and SQL
+can call it:
+
+```clojure
+(sq/with-db [db "app.db"]
+  (sq/create-function! db "initials" 1
+    (fn [s] (apply str (map first (str/split s #" ")))))
+  (sq/query db "select name, initials(name) i from users"))
+;;=> [{:name "rich hickey", :i "rh"}]
+```
+
+The function receives decoded values (longs, doubles, strings, byte
+arrays, nil) and its return value becomes the SQL result. Pass -1 as the
+argument count for a variadic function. An exception inside the function
+becomes a SQL error. Pass `{:deterministic true}` when the function always
+returns the same result for the same arguments, which lets sqlite cache
+calls.
 
 ## Test
 
