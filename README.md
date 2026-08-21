@@ -4,87 +4,111 @@ SQLite for babashka over [babashka.ffi](https://github.com/babashka/babashka/blo
 
 Experimental, like babashka.ffi itself. Needs a babashka with
 `babashka.ffi`. The SQLite shared library ships with macOS, Linux and
-Windows, so there is nothing else to install.
+Windows, so there is nothing else to install. The SQLite version is
+whatever the system provides, so it varies per platform.
 
-## Usage
+## Query
 
 ```clojure
 (require '[babashka.sqlite3 :as sq])
 
-(sq/with-db [db "app.db"]
-  (sq/execute! db "create table if not exists users (name text, age integer)")
-  (sq/execute! db ["insert into users values (?, ?), (?, ?)" "rich" 17 "stu" 12])
-  (sq/query db ["select * from users where age > ?" 15]))
+(sq/query nil "select sqlite_version() v, 1 + 1 sum")
+;;=> [{:v "3.43.2", :sum 2}]
+```
+
+`query` takes a database and SQL, and returns a vector of maps with
+keywordized column names. nil as the database means in memory; a string
+is a file path:
+
+```clojure
+(sq/execute! "app.db" "create table if not exists users (name text, age integer)")
+(sq/execute! "app.db" ["insert into users values (?, ?), (?, ?)" "rich" 17 "stu" 12])
+(sq/query "app.db" ["select * from users where age > ?" 15])
 ;;=> [{:name "rich", :age 17}]
 ```
 
-Pass nil instead of a path for an in-memory database. A string db argument
-opens and closes the database around a single call:
+`execute!` is for statements: it returns
+`{:rows-changed n :last-insert-rowid id}` instead of rows. Parameters
+follow the `[sql & params]` vector shape, so
+[honeysql](https://github.com/seancorfield/honeysql)-formatted vectors
+work as-is.
+
+Values come back typed per cell: INTEGER as a long, REAL as a double,
+TEXT as a string, BLOB as a byte array, NULL as nil. Binds accept the
+same, plus booleans as 0/1.
+
+## Connections
+
+A string database opens and closes the file around each call. For more
+than one operation, hold a connection:
 
 ```clojure
-(sq/query "app.db" "select count(*) n from users")
-;;=> [{:n 2}]
+(sq/with-db [db "app.db"]
+  (sq/execute! db "create table if not exists events (at text, what text)")
+  (sq/execute! db ["insert into events values (?, ?)" "2026-08-22" "ship"])
+  (sq/query db "select * from events"))
 ```
 
-`query` returns a vector of maps with keywordized column names.
-`execute!` returns `{:rows-changed n :last-insert-rowid id}`. SQLite
-types values per cell: INTEGER comes back as a long, REAL as a double,
-TEXT as a string, BLOB as a byte array, NULL as nil.
+Connections set a 5 second busy timeout, so concurrent writers wait
+instead of failing with SQLITE_BUSY. `(sq/open path opts)` and
+`(sq/close! db)` are the functions underneath; `{:read-only true}` opens
+an existing database read-only.
 
-Query vectors follow the `[sql & params]` shape, so
-[honeysql](https://github.com/seancorfield/honeysql)-formatted vectors
-work as-is. Binds accept integers, doubles, strings, byte arrays,
-booleans (as 0/1) and nil.
+## Transactions
 
-`with-transaction` wraps statements in BEGIN IMMEDIATE .. COMMIT and rolls
-back when the body throws:
+`with-transaction` wraps statements in BEGIN IMMEDIATE .. COMMIT and
+rolls back when the body throws. Batching inserts in one transaction is
+also the difference between hundreds and hundreds of thousands of inserts
+per second:
 
 ```clojure
 (sq/with-db [db "app.db"]
   (sq/with-transaction db
-    (doseq [row rows]
-      (sq/execute! db ["insert into events values (?, ?)" (:id row) (:data row)]))))
+    (doseq [i (range 1000)]
+      (sq/execute! db ["insert into events values (?, ?)" (str "day-" i) "tick"]))))
 ```
-
-`interrupt!` aborts the connection's running query from another thread.
-
-Connections set a 5 second busy timeout, so concurrent writers wait
-instead of failing with SQLITE_BUSY. Pass `{:read-only true}` to `open`
-to open an existing database read-only.
 
 ## Clojure functions in SQL
 
-`create-function!` registers a Clojure function on a connection and SQL
-can call it:
+`create-function!` registers a Clojure function on a connection, and SQL
+can call it like any built-in:
 
 ```clojure
-(sq/with-db [db "app.db"]
-  (sq/create-function! db "initials" 1
-    (fn [s] (apply str (map first (str/split s #" ")))))
-  (sq/query db "select name, initials(name) i from users"))
-;;=> [{:name "rich hickey", :i "rh"}]
+(sq/with-db [db nil]
+  (sq/create-function! db "initials"
+    (fn [s] (apply str (map first (clojure.string/split s #" ")))))
+  (sq/query db ["select initials(?) i" "gerald jay sussman"]))
+;;=> [{:i "gjs"}]
 ```
 
-The function receives decoded values (longs, doubles, strings, byte
-arrays, nil) and its return value becomes the SQL result. Pass -1 as the
-argument count for a variadic function. An exception inside the function
-becomes a SQL error. The argument count is optional and defaults to -1,
-any number. Pass `{:deterministic true}` when the function always returns
-the same result for the same arguments, which lets sqlite cache calls.
+The function receives decoded values and its return value becomes the SQL
+result. Without an argument count it accepts any number; pass one to fix
+the arity, and `{:deterministic true}` when the same arguments always
+give the same result, which lets sqlite cache calls. An exception inside
+the function becomes a SQL error.
 
-`create-aggregate!` registers a reduce-style aggregate, usable with group
-by:
+`create-aggregate!` registers a reduce-style aggregate that works with
+group by:
 
 ```clojure
-(sq/create-aggregate! db "product"
-  {:init 1
-   :step (fn [acc v] (* acc v))})
-
-(sq/query db "select grp, product(v) p from m group by grp")
+(sq/with-db [db nil]
+  (sq/execute! db "create table m (grp text, v integer)")
+  (sq/execute! db ["insert into m values (?,?), (?,?), (?,?)" "a" 2 "a" 3 "b" 5])
+  (sq/create-aggregate! db "product"
+    {:init 1
+     :step (fn [acc v] (* acc v))})
+  (sq/query db "select grp, product(v) p from m group by grp order by grp"))
+;;=> [{:grp "a", :p 6} {:grp "b", :p 5}]
 ```
 
+`:init` is the starting accumulator, `:step` folds in each row's values,
 `:finish` (default identity) turns the final accumulator into the SQL
 result.
+
+## Interrupting a query
+
+`(sq/interrupt! db)` aborts the connection's running query from another
+thread; the interrupted query throws.
 
 ## Test
 
