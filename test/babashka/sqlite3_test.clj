@@ -10,10 +10,11 @@
   (sq/with-db [db nil]
     (testing "ddl and insert report rows changed"
       (sq/execute! db "create table t (i integer, r real, s text, b blob)")
-      (is (= {:rows-changed 2}
-             (sq/execute! db ["insert into t values (?, ?, ?, ?), (?, ?, ?, ?)"
-                              1 1.5 "a" (byte-array [1 2 3])
-                              2 2.5 nil nil]))))
+      (is (= 2
+             (:rows-changed
+              (sq/execute! db ["insert into t values (?, ?, ?, ?), (?, ?, ?, ?)"
+                               1 1.5 "a" (byte-array [1 2 3])
+                               2 2.5 nil nil])))))
     (testing "values come back typed per cell, NULL as nil"
       (let [[r1 r2] (sq/query db "select * from t order by i")]
         (is (= [1 1.5 "a"] [(:i r1) (:r r1) (:s r1)]))
@@ -57,6 +58,64 @@
     (testing "deterministic opt registers fine"
       (sq/create-function! db "det" 1 inc {:deterministic true})
       (is (= [{:v 2}] (sq/query db "select det(1) v"))))))
+
+(deftest rowid-and-transaction-test
+  (sq/with-db [db nil]
+    (sq/execute! db "create table t (id integer primary key, s text)")
+    (testing "execute! reports the generated rowid"
+      (is (= 1 (:last-insert-rowid (sq/execute! db ["insert into t (s) values (?)" "a"]))))
+      (is (= 2 (:last-insert-rowid (sq/execute! db ["insert into t (s) values (?)" "b"])))))
+    (testing "with-transaction commits and returns the body value"
+      (is (= :done (sq/with-transaction db
+                     (sq/execute! db ["insert into t (s) values (?)" "c"])
+                     :done)))
+      (is (= [{:n 3}] (sq/query db "select count(*) n from t"))))
+    (testing "a throw rolls back everything since begin"
+      (is (thrown-with-msg? Exception #"kaboom"
+                            (sq/with-transaction db
+                              (sq/execute! db ["insert into t (s) values (?)" "d"])
+                              (throw (ex-info "kaboom" {})))))
+      (is (= [{:n 3}] (sq/query db "select count(*) n from t"))))))
+
+(deftest create-aggregate-test
+  (sq/with-db [db nil]
+    (sq/execute! db "create table m (grp text, v integer)")
+    (sq/execute! db ["insert into m values (?,?), (?,?), (?,?), (?,?)"
+                     "a" 2 "a" 3 "b" 5 "b" 7])
+    (testing "reduce-style aggregate over group by"
+      (sq/create-aggregate! db "product" {:init 1 :step (fn [acc v] (* acc v))})
+      (is (= [{:grp "a" :p 6} {:grp "b" :p 35}]
+             (sq/query db "select grp, product(v) p from m group by grp order by grp"))))
+    (testing ":finish maps the accumulator, zero rows give (finish init)"
+      (sq/create-aggregate! db "cnt2"
+                            {:init 0
+                             :step (fn [acc _] (inc acc))
+                             :finish #(* 2 %)})
+      (is (= [{:c 8}] (sq/query db "select cnt2(v) c from m")))
+      (is (= [{:c 0}] (sq/query db "select cnt2(v) c from m where v > 100"))))
+    (testing "an exception in step becomes a SQL error"
+      (sq/create-aggregate! db "bad" {:init 0 :step (fn [_ _] (throw (ex-info "agg-boom" {})))})
+      (is (thrown-with-msg? Exception #"agg-boom"
+                            (sq/query db "select bad(v) from m"))))))
+
+(deftest nargs-default-test
+  (sq/with-db [db nil]
+    (testing "create-function! without nargs is variadic"
+      (sq/create-function! db "plus" (fn [& xs] (reduce + 0 xs)))
+      (is (= [{:a 3 :b 6}] (sq/query db "select plus(1,2) a, plus(1,2,3) b"))))))
+
+(deftest interrupt-test
+  (sq/with-db [db nil]
+    (testing "interrupt! from another thread aborts a running query"
+      (let [fut (future
+                  (try (sq/query db "with recursive c(x) as
+                                     (select 1 union all select x+1 from c limit 100000000)
+                                     select count(*) n from c")
+                       :finished
+                       (catch Exception _ :interrupted)))]
+        (Thread/sleep 100)
+        (sq/interrupt! db)
+        (is (= :interrupted (deref fut 10000 :timeout)))))))
 
 (deftest open-v2-test
   (testing "read-only refuses writes but reads"

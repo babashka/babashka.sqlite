@@ -26,7 +26,8 @@ opens and closes the database around a single call:
 ;;=> [{:n 2}]
 ```
 
-`query` returns a vector of maps with keywordized column names. SQLite
+`query` returns a vector of maps with keywordized column names.
+`execute!` returns `{:rows-changed n :last-insert-rowid id}`. SQLite
 types values per cell: INTEGER comes back as a long, REAL as a double,
 TEXT as a string, BLOB as a byte array, NULL as nil.
 
@@ -34,6 +35,18 @@ Query vectors follow the `[sql & params]` shape, so
 [honeysql](https://github.com/seancorfield/honeysql)-formatted vectors
 work as-is. Binds accept integers, doubles, strings, byte arrays,
 booleans (as 0/1) and nil.
+
+`with-transaction` wraps statements in BEGIN IMMEDIATE .. COMMIT and rolls
+back when the body throws:
+
+```clojure
+(sq/with-db [db "app.db"]
+  (sq/with-transaction db
+    (doseq [row rows]
+      (sq/execute! db ["insert into events values (?, ?)" (:id row) (:data row)]))))
+```
+
+`interrupt!` aborts the connection's running query from another thread.
 
 Connections set a 5 second busy timeout, so concurrent writers wait
 instead of failing with SQLITE_BUSY. Pass `{:read-only true}` to `open`
@@ -55,9 +68,23 @@ can call it:
 The function receives decoded values (longs, doubles, strings, byte
 arrays, nil) and its return value becomes the SQL result. Pass -1 as the
 argument count for a variadic function. An exception inside the function
-becomes a SQL error. Pass `{:deterministic true}` when the function always
-returns the same result for the same arguments, which lets sqlite cache
-calls.
+becomes a SQL error. The argument count is optional and defaults to -1,
+any number. Pass `{:deterministic true}` when the function always returns
+the same result for the same arguments, which lets sqlite cache calls.
+
+`create-aggregate!` registers a reduce-style aggregate, usable with group
+by:
+
+```clojure
+(sq/create-aggregate! db "product"
+  {:init 1
+   :step (fn [acc v] (* acc v))})
+
+(sq/query db "select grp, product(v) p from m group by grp")
+```
+
+`:finish` (default identity) turns the final accumulator into the SQL
+result.
 
 ## Test
 

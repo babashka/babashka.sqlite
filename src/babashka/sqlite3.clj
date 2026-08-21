@@ -30,6 +30,9 @@
 (defcfn ^:private c-finalize "sqlite3_finalize" [:pointer] :int)
 (defcfn ^:private c-step "sqlite3_step" [:pointer] :int)
 (defcfn ^:private c-changes "sqlite3_changes" [:pointer] :int)
+(defcfn ^:private c-last-insert-rowid "sqlite3_last_insert_rowid" [:pointer] :int64)
+(defcfn ^:private c-interrupt "sqlite3_interrupt" [:pointer] :void)
+(defcfn ^:private c-aggregate-context "sqlite3_aggregate_context" [:pointer :int] :pointer)
 (defcfn ^:private c-column-count "sqlite3_column_count" [:pointer] :int)
 (defcfn ^:private c-column-name "sqlite3_column_name" [:pointer :int] :string)
 (defcfn ^:private c-column-type "sqlite3_column_type" [:pointer :int] :int)
@@ -178,7 +181,8 @@
           (let [rc (c-step stmt)]
             (when-not (or (= SQLITE-DONE rc) (= SQLITE-ROW rc))
               (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:sql sql})))
-            {:rows-changed (c-changes db)})))
+            {:rows-changed (c-changes db)
+             :last-insert-rowid (c-last-insert-rowid db)})))
       (finally
         ;; finalizing a NULL statement (failed prepare) is a no-op
         (c-finalize (ffi/read pstmt :pointer))
@@ -214,35 +218,107 @@
                    (finally (ffi/free p))))
     :else (c-result-error ctx (str "cannot return " (type v) " from a function") -1)))
 
+(defn- decode-args [argc argv]
+  (mapv (fn [i] (decode-value (ffi/read argv :pointer (* 8 i))))
+        (range argc)))
+
+(defn- register! [{:keys [db fns] :as conn} name nargs deterministic xfunc xstep xfinal]
+  (let [cbs (into [] (keep identity) [xfunc xstep xfinal])
+        rc (c-create-function db name nargs
+                              (cond-> SQLITE-UTF8 deterministic (bit-or SQLITE-DETERMINISTIC))
+                              ffi/null
+                              (or xfunc ffi/null)
+                              (or xstep ffi/null)
+                              (or xfinal ffi/null)
+                              ffi/null)]
+    (when-not (zero? rc)
+      (run! ffi/free-callback cbs)
+      (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:function name})))
+    (swap! fns into cbs)
+    conn))
+
 (defn create-function!
   "Registers Clojure function f as SQL function name on the connection.
-  nargs is the argument count, -1 for variadic. f receives decoded values
-  (longs, doubles, strings, byte arrays, nil) and its return value becomes
-  the SQL result. An exception inside f becomes a SQL error. The function
-  stays registered until close!.
+  nargs is the argument count SQL calls must use, -1 (the default) for any
+  number. f receives decoded values (longs, doubles, strings, byte arrays,
+  nil) and its return value becomes the SQL result. An exception inside f
+  becomes a SQL error. The function stays registered until close!.
 
   opts: :deterministic declares that f always returns the same result for
   the same arguments, which lets sqlite cache and optimize calls."
-  ([conn name nargs f] (create-function! conn name nargs f nil))
-  ([{:keys [db fns] :as conn} name nargs f {:keys [deterministic]}]
-   (let [xfunc (fn [ctx argc argv]
-                 ;; an exception crossing the C boundary would abort the
-                 ;; process: everything is caught and reported to sqlite
-                 (try
-                   (let [args (mapv (fn [i] (decode-value (ffi/read argv :pointer (* 8 i))))
-                                    (range argc))]
-                     (set-result! ctx (apply f args)))
-                   (catch Throwable e
-                     (c-result-error ctx (str (ex-message e)) -1))))
-         cb (ffi/callback xfunc [:pointer :int :pointer] :void)
-         rc (c-create-function db name nargs
-                               (cond-> SQLITE-UTF8 deterministic (bit-or SQLITE-DETERMINISTIC))
-                               ffi/null cb ffi/null ffi/null ffi/null)]
-     (when-not (zero? rc)
-       (ffi/free-callback cb)
-       (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:function name})))
-     (swap! fns conj cb)
-     conn)))
+  ([conn name f] (create-function! conn name -1 f nil))
+  ([conn name nargs-or-f f-or-opts]
+   (if (fn? nargs-or-f)
+     (create-function! conn name -1 nargs-or-f f-or-opts)
+     (create-function! conn name nargs-or-f f-or-opts nil)))
+  ([conn name nargs f {:keys [deterministic]}]
+   (let [xfunc (ffi/callback
+                (fn [ctx argc argv]
+                  ;; an exception crossing the C boundary would abort the
+                  ;; process: everything is caught and reported to sqlite
+                  (try
+                    (set-result! ctx (apply f (decode-args argc argv)))
+                    (catch Throwable e
+                      (c-result-error ctx (str (ex-message e)) -1))))
+                [:pointer :int :pointer] :void)]
+     (register! conn name nargs deterministic xfunc nil nil))))
+
+(defn create-aggregate!
+  "Registers a Clojure aggregate as SQL function name on the connection,
+  reduce-style:
+
+      (create-aggregate! db \"product\"
+        {:init 1
+         :step (fn [acc v] (* acc v))})
+
+  :init is the starting accumulator value, :step receives the accumulator
+  and the decoded row values and returns the next accumulator, :finish
+  (default identity) turns the final accumulator into the SQL result.
+  Over zero rows the result is (finish init). nargs as in
+  create-function!, opts likewise (:deterministic).
+
+  State lives per group, so group by works. An exception inside step or
+  finish becomes a SQL error."
+  ([conn name spec] (create-aggregate! conn name -1 spec))
+  ([conn name nargs {:keys [init step finish deterministic]}]
+   (let [finish (or finish identity)
+         states (atom {})
+         next-id (atom 0)
+         ;; sqlite3_aggregate_context gives an 8-byte per-group slot; it
+         ;; holds an id into states, since the accumulator is a Clojure
+         ;; value that cannot live in C memory
+         slot-id (fn [ctx]
+                   (let [slot (c-aggregate-context ctx 8)
+                         id (ffi/read slot :int64)]
+                     (if (zero? id)
+                       (let [id (swap! next-id inc)]
+                         (ffi/write slot :int64 id)
+                         (swap! states assoc id init)
+                         id)
+                       id)))
+         xstep (ffi/callback
+                (fn [ctx argc argv]
+                  (try
+                    (let [id (slot-id ctx)
+                          args (decode-args argc argv)]
+                      (swap! states update id #(apply step % args)))
+                    (catch Throwable e
+                      (c-result-error ctx (str (ex-message e)) -1))))
+                [:pointer :int :pointer] :void)
+         xfinal (ffi/callback
+                 (fn [ctx]
+                   (try
+                     ;; nbytes 0: only look up the slot. NULL when step
+                     ;; never ran (zero rows)
+                     (let [slot (c-aggregate-context ctx 0)
+                           id (if (ffi/null? slot) 0 (ffi/read slot :int64))
+                           acc (if (zero? id) init (get @states id init))]
+                       (swap! states dissoc id)
+                       (set-result! ctx (finish acc)))
+                     (catch Throwable e
+                       (c-result-error ctx (str (ex-message e)) -1))))
+                 [:pointer] :void)]
+     (register! conn name nargs deterministic nil xstep xfinal))))
 
 (defn- with-conn [db-or-path f]
   (if (map? db-or-path)
@@ -257,6 +333,30 @@
   (with-conn db (fn [db] (run* db q true))))
 
 (defn execute!
-  "Runs a statement. Arguments as in query. Returns {:rows-changed n}."
+  "Runs a statement. Arguments as in query. Returns {:rows-changed n
+  :last-insert-rowid id}."
   [db q]
   (with-conn db (fn [db] (run* db q false))))
+
+(defmacro with-transaction
+  "Runs body inside BEGIN IMMEDIATE .. COMMIT on connection db, rolling
+  back when body throws. IMMEDIATE takes the write lock up front, so
+  concurrent writers wait on the busy timeout instead of deadlocking on a
+  lock upgrade. Statements inside the body must use the same connection."
+  [db & body]
+  `(let [db# ~db]
+     (execute! db# "begin immediate")
+     (try
+       (let [res# (do ~@body)]
+         (execute! db# "commit")
+         res#)
+       (catch Throwable e#
+         (execute! db# "rollback")
+         (throw e#)))))
+
+(defn interrupt!
+  "Interrupts the running query on connection db, from any thread. The
+  interrupted query throws."
+  [{:keys [db]}]
+  (c-interrupt db)
+  nil)
