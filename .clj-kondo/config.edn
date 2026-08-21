@@ -1,0 +1,2 @@
+{:lint-as {babashka.ffi/defcfn clj-kondo.lint-as/def-catch-all
+           babashka.sqlite3/with-db clojure.core/with-open}}
