@@ -64,8 +64,10 @@
 (defcfn ^:private c-result-error "sqlite3_result_error" [:pointer :string :int] :void)
 
 ;; SQLITE_TRANSIENT: sqlite must copy text and blob buffers during the bind
-;; call, because the buffers babashka.ffi passes are freed when it returns
-(def ^:private sqlite-transient -1)
+;; call, because the buffers babashka.ffi passes are freed when it returns.
+;; It is the pseudo pointer (void*)-1, not a real address, so it is written
+;; as a raw one
+(def ^:private sqlite-transient (ffi/segment -1))
 
 (defn version
   "Returns the SQLite library version."
@@ -130,18 +132,22 @@
      (try ~@body
           (finally (close! ~sym)))))
 
+(defn- blob-bytes
+  "Copies the n-byte blob at pointer p into a byte array. sqlite gives a
+  NULL pointer for an empty blob."
+  ^bytes [n p]
+  (if (pos? n)
+    ;; a pointer from C has size 0; give it the blob's size first
+    (ffi/read-bytes (ffi/reinterpret p n) n)
+    (byte-array 0)))
+
 ;; sqlite types values per cell, not per column
 (defn- column-value [stmt i]
   (case (c-column-type stmt i)
     1 (c-column-int64 stmt i)
     2 (c-column-double stmt i)
     3 (c-column-text stmt i)
-    4 (let [n (c-column-bytes stmt i)
-            p (c-column-blob stmt i)
-            arr (byte-array n)]
-        (dotimes [j n]
-          (aset arr j (byte (ffi/read p :int8 j))))
-        arr)
+    4 (blob-bytes (c-column-bytes stmt i) (c-column-blob stmt i))
     5 nil))
 
 (defn- bind-params! [db stmt sql params]
@@ -158,8 +164,7 @@
                (bytes? v) (let [n (alength ^bytes v)
                                 p (ffi/alloc (max n 1))]
                             (try
-                              (dotimes [j n]
-                                (ffi/write p :int8 j (aget ^bytes v j)))
+                              (ffi/write-bytes p v)
                               (c-bind-blob stmt i p n sqlite-transient)
                               (finally (ffi/free p))))
                :else (throw (ex-info (str "sqlite3: cannot bind " (type v))
@@ -208,11 +213,7 @@
     1 (c-value-int64 pv)
     2 (c-value-double pv)
     3 (c-value-text pv)
-    4 (let [n (c-value-bytes pv)
-            p (c-value-blob pv)
-            arr (byte-array n)]
-        (dotimes [j n] (aset arr j (byte (ffi/read p :int8 j))))
-        arr)
+    4 (blob-bytes (c-value-bytes pv) (c-value-blob pv))
     5 nil))
 
 (defn- set-result! [ctx v]
@@ -225,14 +226,16 @@
     (bytes? v) (let [n (alength ^bytes v)
                      p (ffi/alloc (max n 1))]
                  (try
-                   (dotimes [j n] (ffi/write p :int8 j (aget ^bytes v j)))
+                   (ffi/write-bytes p v)
                    (c-result-blob ctx p n sqlite-transient)
                    (finally (ffi/free p))))
     :else (c-result-error ctx (str "cannot return " (type v) " from a function") -1)))
 
 (defn- decode-args [argc argv]
-  (mapv (fn [i] (decode-value (ffi/read argv :pointer (* 8 i))))
-        (range argc)))
+  ;; argv comes from C with size 0; it holds argc pointers
+  (let [argv (ffi/reinterpret argv (* 8 argc))]
+    (mapv (fn [i] (decode-value (ffi/read argv :pointer (* 8 i))))
+          (range argc))))
 
 (defn- register! [{:keys [db fns] :as conn} name nargs deterministic xfunc xstep xfinal]
   (let [cbs (into [] (keep identity) [xfunc xstep xfinal])
@@ -307,7 +310,7 @@
          ;; holds an id into states, since the accumulator is a Clojure
          ;; value that cannot live in C memory
          slot-id (fn [ctx]
-                   (let [slot (c-aggregate-context ctx 8)
+                   (let [slot (ffi/reinterpret (c-aggregate-context ctx 8) 8)
                          id (ffi/read slot :int64)]
                      (if (zero? id)
                        (let [id (swap! next-id inc)]
@@ -330,7 +333,7 @@
                      ;; nbytes 0: only look up the slot. NULL when step
                      ;; never ran (zero rows)
                      (let [slot (c-aggregate-context ctx 0)
-                           id (if (ffi/null? slot) 0 (ffi/read slot :int64))
+                           id (if (ffi/null? slot) 0 (ffi/read (ffi/reinterpret slot 8) :int64))
                            acc (if (zero? id) init (get @states id init))]
                        (swap! states dissoc id)
                        (set-result! ctx (finish acc)))
