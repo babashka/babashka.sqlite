@@ -23,7 +23,6 @@
                    :windows ["sqlite3.dll" "winsqlite3.dll"]})
 
 (defcfn ^:private c-initialize "sqlite3_initialize" [] :int)
-(defcfn ^:private c-libversion "sqlite3_libversion" [] :string)
 (defcfn ^:private c-close "sqlite3_close" [:pointer] :int)
 (defcfn ^:private c-errmsg "sqlite3_errmsg" [:pointer] :string)
 (defcfn ^:private c-busy-timeout "sqlite3_busy_timeout" [:pointer :int] :int)
@@ -32,7 +31,6 @@
 (defcfn ^:private c-step "sqlite3_step" [:pointer] :int)
 (defcfn ^:private c-changes "sqlite3_changes" [:pointer] :int)
 (defcfn ^:private c-last-insert-rowid "sqlite3_last_insert_rowid" [:pointer] :int64)
-(defcfn ^:private c-interrupt "sqlite3_interrupt" [:pointer] :void)
 (defcfn ^:private c-aggregate-context "sqlite3_aggregate_context" [:pointer :int] :pointer)
 (defcfn ^:private c-column-count "sqlite3_column_count" [:pointer] :int)
 (defcfn ^:private c-column-name "sqlite3_column_name" [:pointer :int] :string)
@@ -69,10 +67,9 @@
 ;; as a raw one
 (def ^:private sqlite-transient (ffi/segment -1))
 
-(defn version
+(defcfn version
   "Returns the SQLite library version."
-  []
-  (c-libversion))
+  "sqlite3_libversion" [] :string)
 
 ;; builds compiled with SQLITE_OMIT_AUTOINIT (common for standalone
 ;; Windows dlls) crash in sqlite3_open unless the library is initialized
@@ -94,21 +91,20 @@
   ([path] (open path nil))
   ([path {:keys [read-only flags]}]
    @initialized
-   (let [pdb (ffi/alloc (ffi/sizeof :pointer))
-         flags (or flags
-                   (if read-only
-                     SQLITE-OPEN-READONLY
-                     (bit-or SQLITE-OPEN-READWRITE SQLITE-OPEN-CREATE)))]
-     (try
-       (let [rc (c-open-v2 (or path ":memory:") pdb flags ffi/null)
-             db (ffi/read pdb :pointer)]
-         (when-not (zero? rc)
-           (let [msg (c-errmsg db)]
-             (c-close db)
-             (throw (ex-info (str "sqlite3: " msg) {:path path}))))
-         (c-busy-timeout db 5000)
-         {:db db :fns (atom [])})
-       (finally (ffi/free pdb))))))
+   (with-open [arena (ffi/confined-arena)]
+     (let [pdb (ffi/alloc arena :pointer)
+           flags (or flags
+                     (if read-only
+                       SQLITE-OPEN-READONLY
+                       (bit-or SQLITE-OPEN-READWRITE SQLITE-OPEN-CREATE)))
+           rc (c-open-v2 (or path ":memory:") pdb flags ffi/null)
+           db (ffi/read pdb :pointer)]
+       (when-not (zero? rc)
+         (let [msg (c-errmsg db)]
+           (c-close db)
+           (throw (ex-info (str "sqlite3: " msg) {:path path}))))
+       (c-busy-timeout db 5000)
+       {:db db :fns (atom [])}))))
 
 (defn close!
   "Closes a connection from open and releases its registered functions.
@@ -161,12 +157,11 @@
                ;; nbytes -1: read the UTF-8 C string up to its NUL. Text
                ;; with embedded NUL characters is not supported.
                (string? v) (c-bind-text stmt i v -1 sqlite-transient)
-               (bytes? v) (let [n (alength ^bytes v)
-                                p (ffi/alloc (max n 1))]
-                            (try
+               (bytes? v) (with-open [arena (ffi/confined-arena)]
+                            (let [n (alength ^bytes v)
+                                  p (ffi/alloc arena (max n 1))]
                               (ffi/write-bytes p v)
-                              (c-bind-blob stmt i p n sqlite-transient)
-                              (finally (ffi/free p))))
+                              (c-bind-blob stmt i p n sqlite-transient)))
                :else (throw (ex-info (str "sqlite3: cannot bind " (type v))
                                      {:value v})))]
       (when-not (zero? rc)
@@ -176,34 +171,34 @@
 (def ^:private SQLITE-DONE 101)
 
 (defn- run* [conn q collect-rows?]
-  (let [[sql & params] (if (string? q) [q] q)
-        db (:db conn)
-        pstmt (ffi/alloc (ffi/sizeof :pointer))]
-    (try
-      (when-not (zero? (c-prepare db sql -1 pstmt ffi/null))
-        (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:sql sql})))
-      (let [stmt (ffi/read pstmt :pointer)]
-        (bind-params! db stmt sql params)
-        (if collect-rows?
-          (let [cols (delay (mapv (fn [i] [(keyword (c-column-name stmt i)) i])
-                                  (range (c-column-count stmt))))]
-            (loop [rows (transient [])]
-              (let [rc (c-step stmt)]
-                (cond
-                  (= SQLITE-ROW rc)
-                  (recur (conj! rows (into {} (map (fn [[k i]] [k (column-value stmt i)]))
-                                           @cols)))
-                  (= SQLITE-DONE rc) (persistent! rows)
-                  :else (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:sql sql}))))))
-          (let [rc (c-step stmt)]
-            (when-not (or (= SQLITE-DONE rc) (= SQLITE-ROW rc))
-              (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:sql sql})))
-            {:rows-changed (c-changes db)
-             :last-insert-rowid (c-last-insert-rowid db)})))
-      (finally
-        ;; finalizing a NULL statement (failed prepare) is a no-op
-        (c-finalize (ffi/read pstmt :pointer))
-        (ffi/free pstmt)))))
+  (with-open [arena (ffi/confined-arena)]
+    (let [[sql & params] (if (string? q) [q] q)
+          db (:db conn)
+          pstmt (ffi/alloc arena :pointer)]
+      (try
+        (when-not (zero? (c-prepare db sql -1 pstmt ffi/null))
+          (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:sql sql})))
+        (let [stmt (ffi/read pstmt :pointer)]
+          (bind-params! db stmt sql params)
+          (if collect-rows?
+            (let [cols (delay (mapv (fn [i] [(keyword (c-column-name stmt i)) i])
+                                    (range (c-column-count stmt))))]
+              (loop [rows (transient [])]
+                (let [rc (c-step stmt)]
+                  (cond
+                    (= SQLITE-ROW rc)
+                    (recur (conj! rows (into {} (map (fn [[k i]] [k (column-value stmt i)]))
+                                             @cols)))
+                    (= SQLITE-DONE rc) (persistent! rows)
+                    :else (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:sql sql}))))))
+            (let [rc (c-step stmt)]
+              (when-not (or (= SQLITE-DONE rc) (= SQLITE-ROW rc))
+                (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:sql sql})))
+              {:rows-changed (c-changes db)
+               :last-insert-rowid (c-last-insert-rowid db)})))
+        (finally
+          ;; finalizing a NULL statement (failed prepare) is a no-op
+          (c-finalize (ffi/read pstmt :pointer)))))))
 
 (def ^:private SQLITE-UTF8 1)
 (def ^:private SQLITE-DETERMINISTIC 0x800)
@@ -223,12 +218,11 @@
     (integer? v) (c-result-int64 ctx v)
     (float? v) (c-result-double ctx v)
     (string? v) (c-result-text ctx v -1 sqlite-transient)
-    (bytes? v) (let [n (alength ^bytes v)
-                     p (ffi/alloc (max n 1))]
-                 (try
+    (bytes? v) (with-open [arena (ffi/confined-arena)]
+                 (let [n (alength ^bytes v)
+                       p (ffi/alloc arena (max n 1))]
                    (ffi/write-bytes p v)
-                   (c-result-blob ctx p n sqlite-transient)
-                   (finally (ffi/free p))))
+                   (c-result-blob ctx p n sqlite-transient)))
     :else (c-result-error ctx (str "cannot return " (type v) " from a function") -1)))
 
 (defn- decode-args [argc argv]
@@ -384,9 +378,11 @@
          (execute! db# "rollback")
          (throw e#)))))
 
-(defn interrupt!
+(defcfn interrupt!
   "Interrupts the running query on db. Call this function from another thread.
   The interrupted query throws an exception. Returns nil."
+  "sqlite3_interrupt" [:pointer] :void
+  interrupt-native
   [{:keys [db]}]
-  (c-interrupt db)
+  (interrupt-native db)
   nil)
