@@ -1,3 +1,2 @@
-{:hooks {:analyze-call {babashka.ffi/defcfn hooks.babashka.ffi/defcfn}}
- :lint-as {babashka.sqlite3/with-db clojure.core/with-open
+{:lint-as {babashka.sqlite3/with-db clojure.core/with-open
            babashka.sqlite3/with-transaction clojure.core/locking}}
