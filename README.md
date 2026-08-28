@@ -1,4 +1,4 @@
-# ffi-sqlite3
+# babashka.sqlite
 
 Use SQLite from babashka through
 [babashka.ffi](https://github.com/babashka/babashka/blob/master/doc/ffi.md).
@@ -13,7 +13,7 @@ depends on the system.
 ## Query
 
 ```clojure
-(require '[babashka.sqlite3 :as sq])
+(require '[babashka.sqlite :as sq])
 
 (sq/query nil "select sqlite_version() v, 1 + 1 sum")
 ;;=> [{:v "3.43.2", :sum 2}]

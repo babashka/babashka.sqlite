@@ -1,4 +1,4 @@
-(ns babashka.sqlite3
+(ns babashka.sqlite
   "Use SQLite from babashka through babashka.ffi. Pass SQL as a string or
   as a [sql & params] vector:
 
