@@ -1,2 +1,2 @@
-{:lint-as {babashka.sqlite3/with-db clojure.core/with-open
-           babashka.sqlite3/with-transaction clojure.core/locking}}
+{:lint-as {babashka.sqlite/with-db clojure.core/with-open
+           babashka.sqlite/with-transaction clojure.core/locking}}

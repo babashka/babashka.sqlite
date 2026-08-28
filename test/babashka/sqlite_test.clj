@@ -1,5 +1,5 @@
-(ns babashka.sqlite3-test
-  (:require [babashka.sqlite3 :as sq]
+(ns babashka.sqlite-test
+  (:require [babashka.sqlite :as sq]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]))
 
@@ -120,7 +120,7 @@
 (deftest open-v2-test
   (testing "read-only refuses writes but reads"
     (let [path (str (System/getProperty "java.io.tmpdir")
-                    "/ffi-sqlite3-ro-" (System/currentTimeMillis) ".db")]
+                    "/babashka-sqlite-ro-" (System/currentTimeMillis) ".db")]
       (sq/execute! path "create table k (v integer)")
       (sq/execute! path "insert into k values (7)")
       (let [db (sq/open path {:read-only true})]
@@ -133,7 +133,7 @@
 (deftest path-test
   (testing "a string db opens and closes around the call"
     (let [path (str (System/getProperty "java.io.tmpdir")
-                    "/ffi-sqlite3-test-" (System/currentTimeMillis) ".db")]
+                    "/babashka-sqlite-test-" (System/currentTimeMillis) ".db")]
       (sq/execute! path "create table k (answer integer)")
       (sq/execute! path "insert into k values (42)")
       (is (= [{:answer 42}] (sq/query path "select * from k"))))))
