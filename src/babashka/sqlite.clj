@@ -104,16 +104,20 @@
            (c-close db)
            (throw (ex-info (str "sqlite3: " msg) {:path path}))))
        (c-busy-timeout db 5000)
-       {:db db :fns (atom [])}))))
+       ;; a shared arena owns every callback registered on this connection:
+       ;; sqlite calls them on whichever thread runs the statement, and
+       ;; close! releases them together with the connection
+       {:db db :arena (ffi/shared-arena)}))))
 
 (defn close!
   "Closes a connection from open and releases its registered functions.
   Returns nil."
-  [{:keys [db fns]}]
+  [{:keys [db arena]}]
   (c-close db)
-  (when fns
-    (doseq [cb @fns] (ffi/free-callback cb))
-    (reset! fns []))
+  (when arena
+    ;; releases every callback that create-function! and create-aggregate!
+    ;; allocated in it
+    (.close ^java.lang.AutoCloseable arena))
   nil)
 
 (defmacro with-db
@@ -231,9 +235,8 @@
     (mapv (fn [i] (decode-value (ffi/read argv :pointer (* 8 i))))
           (range argc))))
 
-(defn- register! [{:keys [db fns] :as conn} name nargs deterministic xfunc xstep xfinal]
-  (let [cbs (into [] (keep identity) [xfunc xstep xfinal])
-        rc (c-create-function db name nargs
+(defn- register! [{:keys [db] :as conn} name nargs deterministic xfunc xstep xfinal]
+  (let [rc (c-create-function db name nargs
                               (cond-> SQLITE-UTF8 deterministic (bit-or SQLITE-DETERMINISTIC))
                               ffi/null
                               (or xfunc ffi/null)
@@ -241,9 +244,9 @@
                               (or xfinal ffi/null)
                               ffi/null)]
     (when-not (zero? rc)
-      (run! ffi/free-callback cbs)
+      ;; the callbacks stay in the connection's arena: sqlite may hold them
+      ;; already, and close! releases them either way
       (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:function name})))
-    (swap! fns into cbs)
     conn))
 
 (defn create-function!
@@ -266,6 +269,7 @@
      (create-function! conn name nargs-or-f f-or-opts nil)))
   ([conn name nargs f {:keys [deterministic]}]
    (let [xfunc (ffi/callback
+                (:arena conn)
                 (fn [ctx argc argv]
                   ;; an exception crossing the C boundary would abort the
                   ;; process: everything is caught and reported to sqlite
@@ -313,6 +317,7 @@
                          id)
                        id)))
          xstep (ffi/callback
+                (:arena conn)
                 (fn [ctx argc argv]
                   (try
                     (let [id (slot-id ctx)
@@ -322,6 +327,7 @@
                       (c-result-error ctx (str (ex-message e)) -1))))
                 [:pointer :int :pointer] :void)
          xfinal (ffi/callback
+                 (:arena conn)
                  (fn [ctx]
                    (try
                      ;; nbytes 0: only look up the slot. NULL when step
