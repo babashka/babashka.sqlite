@@ -137,3 +137,30 @@
       (sq/execute! path "create table k (answer integer)")
       (sq/execute! path "insert into k values (42)")
       (is (= [{:answer 42}] (sq/query path "select * from k"))))))
+
+(defn- refused-registration
+  "Returns a function that registers something this sqlite refuses, or nil
+  when it refuses none of them. Which registrations get rejected depends on
+  the build: winsqlite3 raises SQLITE_MAX_FUNCTION_ARG, so it accepts an
+  argument count that other builds refuse. The 255-byte limit on a function
+  name is a constant in sqlite's core, so it holds everywhere."
+  []
+  (sq/with-db [probe nil]
+    (first (for [f [#(sq/create-function! % (apply str (repeat 300 "x")) 1 identity)
+                    #(sq/create-function! % "too_wide" 200 identity)]
+                 :when (try (f probe) false (catch Exception _ true))]
+             f))))
+
+(deftest failed-registration-test
+  (if-let [refuse! (refused-registration)]
+    (sq/with-db [db nil]
+      (testing "a registration that sqlite refuses does not keep its callbacks"
+        (dotimes [_ 20]
+          (is (thrown? Exception (refuse! db))))
+        ;; each failure closed its own arena, so nothing accumulated
+        (is (zero? (count @(:arenas db)))))
+      (testing "a registration that succeeds is still released by close!"
+        (sq/create-function! db "ok" 1 inc)
+        (is (= 1 (count @(:arenas db))))
+        (is (= [{:v 2}] (sq/query db "select ok(1) v")))))
+    (println "failed registration skipped: this sqlite refused none of the probes")))
