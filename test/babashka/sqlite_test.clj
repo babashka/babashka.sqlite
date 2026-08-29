@@ -137,3 +137,16 @@
       (sq/execute! path "create table k (answer integer)")
       (sq/execute! path "insert into k values (42)")
       (is (= [{:answer 42}] (sq/query path "select * from k"))))))
+
+(deftest failed-registration-test
+  (sq/with-db [db nil]
+    (testing "a registration that sqlite refuses does not keep its callbacks"
+      ;; sqlite3_create_function rejects an argument count above 127
+      (dotimes [_ 20]
+        (is (thrown? Exception (sq/create-function! db "too_wide" 200 identity))))
+      ;; each failure closed its own arena, so nothing accumulated
+      (is (zero? (count @(:arenas db)))))
+    (testing "a registration that succeeds is still released by close!"
+      (sq/create-function! db "ok" 1 inc)
+      (is (= 1 (count @(:arenas db))))
+      (is (= [{:v 2}] (sq/query db "select ok(1) v"))))))

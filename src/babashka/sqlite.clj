@@ -104,20 +104,22 @@
            (c-close db)
            (throw (ex-info (str "sqlite3: " msg) {:path path}))))
        (c-busy-timeout db 5000)
-       ;; a shared arena owns every callback registered on this connection:
-       ;; sqlite calls them on whichever thread runs the statement, and
-       ;; close! releases them together with the connection
-       {:db db :arena (ffi/shared-arena)}))))
+       ;; one shared arena per registered function: sqlite calls a callback
+       ;; on whichever thread runs the statement, so it cannot be confined,
+       ;; and a registration that fails closes its own arena instead of
+       ;; leaving the stubs behind. close! closes whatever is left.
+       {:db db :arenas (atom [])}))))
 
 (defn close!
   "Closes a connection from open and releases its registered functions.
   Returns nil."
-  [{:keys [db arena]}]
+  [{:keys [db arenas]}]
   (c-close db)
-  (when arena
+  (when arenas
     ;; releases every callback that create-function! and create-aggregate!
-    ;; allocated in it
-    (.close ^java.lang.AutoCloseable arena))
+    ;; allocated
+    (doseq [a @arenas] (.close ^java.lang.AutoCloseable a))
+    (reset! arenas []))
   nil)
 
 (defmacro with-db
@@ -235,7 +237,7 @@
     (mapv (fn [i] (decode-value (ffi/read argv :pointer (* 8 i))))
           (range argc))))
 
-(defn- register! [{:keys [db] :as conn} name nargs deterministic xfunc xstep xfinal]
+(defn- register! [{:keys [db arenas] :as conn} arena name nargs deterministic xfunc xstep xfinal]
   (let [rc (c-create-function db name nargs
                               (cond-> SQLITE-UTF8 deterministic (bit-or SQLITE-DETERMINISTIC))
                               ffi/null
@@ -244,9 +246,10 @@
                               (or xfinal ffi/null)
                               ffi/null)]
     (when-not (zero? rc)
-      ;; the callbacks stay in the connection's arena: sqlite may hold them
-      ;; already, and close! releases them either way
+      ;; sqlite did not take the callbacks, so nothing can call them
+      (.close ^java.lang.AutoCloseable arena)
       (throw (ex-info (str "sqlite3: " (c-errmsg db)) {:function name})))
+    (swap! arenas conj arena)
     conn))
 
 (defn create-function!
@@ -268,8 +271,9 @@
      (create-function! conn name -1 nargs-or-f f-or-opts)
      (create-function! conn name nargs-or-f f-or-opts nil)))
   ([conn name nargs f {:keys [deterministic]}]
-   (let [xfunc (ffi/callback
-                (:arena conn)
+   (let [arena (ffi/shared-arena)
+         xfunc (ffi/callback
+                arena
                 (fn [ctx argc argv]
                   ;; an exception crossing the C boundary would abort the
                   ;; process: everything is caught and reported to sqlite
@@ -278,7 +282,7 @@
                     (catch Throwable e
                       (c-result-error ctx (str (ex-message e)) -1))))
                 [:pointer :int :pointer] :void)]
-     (register! conn name nargs deterministic xfunc nil nil))))
+     (register! conn arena name nargs deterministic xfunc nil nil))))
 
 (defn create-aggregate!
   "Registers a reduce-style aggregate on conn. SQL calls the aggregate by name.
@@ -301,7 +305,8 @@
   or :finish becomes a SQL error."
   ([conn name spec] (create-aggregate! conn name -1 spec))
   ([conn name nargs {:keys [init step finish deterministic]}]
-   (let [finish (or finish identity)
+   (let [arena (ffi/shared-arena)
+         finish (or finish identity)
          states (atom {})
          next-id (atom 0)
          ;; sqlite3_aggregate_context gives an 8-byte per-group slot; it
@@ -317,7 +322,7 @@
                          id)
                        id)))
          xstep (ffi/callback
-                (:arena conn)
+                arena
                 (fn [ctx argc argv]
                   (try
                     (let [id (slot-id ctx)
@@ -327,7 +332,7 @@
                       (c-result-error ctx (str (ex-message e)) -1))))
                 [:pointer :int :pointer] :void)
          xfinal (ffi/callback
-                 (:arena conn)
+                 arena
                  (fn [ctx]
                    (try
                      ;; nbytes 0: only look up the slot. NULL when step
@@ -340,7 +345,7 @@
                      (catch Throwable e
                        (c-result-error ctx (str (ex-message e)) -1))))
                  [:pointer] :void)]
-     (register! conn name nargs deterministic nil xstep xfinal))))
+     (register! conn arena name nargs deterministic nil xstep xfinal))))
 
 (defn- with-conn [db-or-path f]
   (if (map? db-or-path)
