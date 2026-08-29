@@ -140,7 +140,7 @@
   ^bytes [n p]
   (if (pos? n)
     ;; a pointer from C has size 0; give it the blob's size first
-    (ffi/read-bytes (ffi/reinterpret p n) n)
+    (ffi/read-array (ffi/reinterpret p n) :byte n)
     (byte-array 0)))
 
 ;; sqlite types values per cell, not per column
@@ -166,7 +166,7 @@
                (bytes? v) (with-open [arena (ffi/confined-arena)]
                             (let [n (alength ^bytes v)
                                   p (ffi/alloc arena (max n 1))]
-                              (ffi/write-bytes p v)
+                              (ffi/write-array p :byte v)
                               (c-bind-blob stmt i p n sqlite-transient)))
                :else (throw (ex-info (str "sqlite3: cannot bind " (type v))
                                      {:value v})))]
@@ -227,7 +227,7 @@
     (bytes? v) (with-open [arena (ffi/confined-arena)]
                  (let [n (alength ^bytes v)
                        p (ffi/alloc arena (max n 1))]
-                   (ffi/write-bytes p v)
+                   (ffi/write-array p :byte v)
                    (c-result-blob ctx p n sqlite-transient)))
     :else (c-result-error ctx (str "cannot return " (type v) " from a function") -1)))
 
