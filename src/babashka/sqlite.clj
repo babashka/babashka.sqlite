@@ -8,7 +8,7 @@
   A string file path opens and closes a connection for each call. nil uses an
   in-memory database. Keep one connection open for multiple operations:
 
-      (sq/with-db [db \"app.db\"]
+      (sq/with-conn [db \"app.db\"]
         (sq/execute! db \"create table t (i integer, s text)\")
         (sq/query db \"select * from t\"))
 
@@ -122,12 +122,12 @@
     (reset! arenas []))
   nil)
 
-(defmacro with-db
+(defmacro with-conn
   "Opens a database for the enclosed code. Closes the connection after the
   code finishes. Returns the result of the enclosed code. Use nil for an
   in-memory database.
 
-      (with-db [db \"app.db\"]
+      (with-conn [db \"app.db\"]
         (query db \"select * from users\"))"
   [[sym path] & body]
   `(let [~sym (open ~path)]
@@ -347,10 +347,10 @@
                  [:pointer] :void)]
      (register! conn arena name nargs deterministic nil xstep xfinal))))
 
-(defn- with-conn [db-or-path f]
+(defn- call-with-conn [db-or-path f]
   (if (map? db-or-path)
     (f db-or-path)
-    (with-db [db db-or-path] (f db))))
+    (with-conn [db db-or-path] (f db))))
 
 (defn query
   "Runs a query and returns a vector of maps. Each map is one result row.
@@ -361,7 +361,7 @@
   next value in the vector. A file path or nil opens and closes a connection
   for this call."
   [db q]
-  (with-conn db (fn [db] (run* db q true))))
+  (call-with-conn db (fn [db] (run* db q true))))
 
 (defn execute!
   "Runs a statement and returns {:rows-changed n :last-insert-rowid id}.
@@ -370,7 +370,7 @@
   :last-insert-rowid is the row ID from the most recent insert on the
   connection. db and q accept the same values as query."
   [db q]
-  (with-conn db (fn [db] (run* db q false))))
+  (call-with-conn db (fn [db] (run* db q false))))
 
 (defmacro with-transaction
   "Evaluates body in an immediate transaction on db. Commits when body returns

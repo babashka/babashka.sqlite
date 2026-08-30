@@ -7,7 +7,7 @@
   (is (re-find #"^3\." (sq/version))))
 
 (deftest query-test
-  (sq/with-db [db nil]
+  (sq/with-conn [db nil]
     (testing "ddl and insert report rows changed"
       (sq/execute! db "create table t (i integer, r real, s text, b blob)")
       (is (= 2
@@ -34,7 +34,7 @@
       (is (= [{:one 1}] (sq/query db "select 1 one"))))))
 
 (deftest create-function-test
-  (sq/with-db [db nil]
+  (sq/with-conn [db nil]
     (testing "a Clojure fn is callable from SQL"
       (sq/create-function! db "plus2" 1 #(+ % 2))
       (is (= [{:v 42}] (sq/query db "select plus2(40) v"))))
@@ -60,7 +60,7 @@
       (is (= [{:v 2}] (sq/query db "select det(1) v"))))))
 
 (deftest rowid-and-transaction-test
-  (sq/with-db [db nil]
+  (sq/with-conn [db nil]
     (sq/execute! db "create table t (id integer primary key, s text)")
     (testing "execute! reports the generated rowid"
       (is (= 1 (:last-insert-rowid (sq/execute! db ["insert into t (s) values (?)" "a"]))))
@@ -78,7 +78,7 @@
       (is (= [{:n 3}] (sq/query db "select count(*) n from t"))))))
 
 (deftest create-aggregate-test
-  (sq/with-db [db nil]
+  (sq/with-conn [db nil]
     (sq/execute! db "create table m (grp text, v integer)")
     (sq/execute! db ["insert into m values (?,?), (?,?), (?,?), (?,?)"
                      "a" 2 "a" 3 "b" 5 "b" 7])
@@ -99,13 +99,13 @@
                             (sq/query db "select bad(v) from m"))))))
 
 (deftest nargs-default-test
-  (sq/with-db [db nil]
+  (sq/with-conn [db nil]
     (testing "create-function! without nargs is variadic"
       (sq/create-function! db "plus" (fn [& xs] (reduce + 0 xs)))
       (is (= [{:a 3 :b 6}] (sq/query db "select plus(1,2) a, plus(1,2,3) b"))))))
 
 (deftest interrupt-test
-  (sq/with-db [db nil]
+  (sq/with-conn [db nil]
     (testing "interrupt! from another thread aborts a running query"
       (let [fut (future
                   (try (sq/query db "with recursive c(x) as
@@ -145,7 +145,7 @@
   argument count that other builds refuse. The 255-byte limit on a function
   name is a constant in sqlite's core, so it holds everywhere."
   []
-  (sq/with-db [probe nil]
+  (sq/with-conn [probe nil]
     (first (for [f [#(sq/create-function! % (apply str (repeat 300 "x")) 1 identity)
                     #(sq/create-function! % "too_wide" 200 identity)]
                  :when (try (f probe) false (catch Exception _ true))]
@@ -153,7 +153,7 @@
 
 (deftest failed-registration-test
   (if-let [refuse! (refused-registration)]
-    (sq/with-db [db nil]
+    (sq/with-conn [db nil]
       (testing "a registration that sqlite refuses does not keep its callbacks"
         (dotimes [_ 20]
           (is (thrown? Exception (refuse! db))))

@@ -76,7 +76,7 @@ A string file path opens and closes a connection for each call. For multiple
 operations, keep one connection open:
 
 ```clojure
-(sq/with-db [db "app.db"]
+(sq/with-conn [db "app.db"]
   (sq/execute! db "create table if not exists events (at text, what text)")
   (sq/execute! db ["insert into events values (?, ?)" "2026-08-22" "ship"])
   (sq/query db "select * from events"))
@@ -86,7 +86,7 @@ Each connection has a five-second busy timeout. A concurrent writer waits
 for the lock during this period instead of immediately returning
 `SQLITE_BUSY`.
 
-Use `(sq/open path opts)` and `(sq/close! db)` when you cannot use `with-db`.
+Use `(sq/open path opts)` and `(sq/close! db)` when you cannot use `with-conn`.
 The option `{:read-only true}` opens an existing database without write
 access.
 
@@ -121,7 +121,7 @@ transaction when the body throws.
 Use one transaction for a batch of inserts:
 
 ```clojure
-(sq/with-db [db "app.db"]
+(sq/with-conn [db "app.db"]
   (sq/with-transaction db
     (doseq [i (range 1000)]
       (sq/execute! db ["insert into events values (?, ?)" (str "day-" i) "tick"]))))
@@ -133,7 +133,7 @@ Use one transaction for a batch of inserts:
 then call the function by its registered name.
 
 ```clojure
-(sq/with-db [db nil]
+(sq/with-conn [db nil]
   (sq/create-function! db "initials"
     (fn [s] (apply str (map first (clojure.string/split s #" ")))))
   (sq/query db ["select initials(?) i" "gerald jay sussman"]))
@@ -152,7 +152,7 @@ the function becomes a SQL error.
 aggregate with `GROUP BY`.
 
 ```clojure
-(sq/with-db [db nil]
+(sq/with-conn [db nil]
   (sq/execute! db "create table m (grp text, v integer)")
   (sq/execute! db ["insert into m values (?,?), (?,?), (?,?)" "a" 2 "a" 3 "b" 5])
   (sq/create-aggregate! db "product"
