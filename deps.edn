@@ -3,7 +3,7 @@
  ;; babashka/ffi repository.
  :deps {io.github.babashka/ffi
         {:git/url "https://github.com/babashka/ffi"
-         :git/sha "e4700ac76a61f7f3a7755fafa5784a2f86f6d137"}}
+         :git/sha "5d39a9157ce1f6294d2ff7af84147cb7e568fce1"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
