@@ -181,6 +181,20 @@ separate state for each group.
 Call `(sq/interrupt! db)` from another thread to interrupt a query. The
 interrupted query throws an exception.
 
+## FAQ
+
+### Should I use this library or the pod?
+
+Use this library to call SQLite directly within the babashka process. The
+[pod-babashka-go-sqlite3](https://github.com/babashka/pod-babashka-go-sqlite3)
+pod runs in a separate process and communicates over stdio for each call and
+result.
+
+With a native babashka build, this library is about 3 times faster than the pod
+for large result sets and 5 to 10 times faster for single-row queries and inserts.
+
+Use the pod if your babashka build does not include `babashka.ffi`.
+
 ## Test
 
 Run the tests:
